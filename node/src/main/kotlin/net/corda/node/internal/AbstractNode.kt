@@ -20,6 +20,7 @@ import net.corda.core.messaging.SingleMessageRecipient
 import net.corda.core.node.*
 import net.corda.core.node.services.*
 import net.corda.core.node.services.NetworkMapCache.MapChange
+import net.corda.core.node.services.NotaryService
 import net.corda.core.serialization.SerializeAsToken
 import net.corda.core.serialization.SingletonSerializeAsToken
 import net.corda.core.serialization.deserialize
@@ -59,7 +60,6 @@ import net.corda.node.utilities.AddOrRemove.ADD
 import net.corda.node.utilities.AffinityExecutor
 import net.corda.node.utilities.configureDatabase
 import net.corda.node.utilities.transaction
-import net.corda.nodeapi.ArtemisMessagingComponent
 import org.apache.activemq.artemis.utils.ReusableLatch
 import org.bouncycastle.asn1.x500.X500Name
 import org.jetbrains.exposed.sql.Database
@@ -133,7 +133,9 @@ abstract class AbstractNode(open val configuration: NodeConfiguration,
         override val myInfo: NodeInfo get() = info
         override val schemaService: SchemaService get() = schemas
         override val transactionVerifierService: TransactionVerifierService get() = txVerifierService
-        override val auditService: AuditService get() = auditService
+        override val auditService: AuditService get() = this@AbstractNode.auditService
+        override val database: Database get() = this@AbstractNode.database
+        override val configuration: NodeConfiguration get() = this@AbstractNode.configuration
 
         override fun <T : SerializeAsToken> cordaService(type: Class<T>): T {
             require(type.isAnnotationPresent(CordaService::class.java)) { "${type.name} is not a Corda service" }
@@ -292,8 +294,10 @@ abstract class AbstractNode(open val configuration: NodeConfiguration,
                 .filter {
                     val serviceType = getServiceType(it)
                     if (serviceType != null && info.serviceIdentities(serviceType).isEmpty()) {
-                        log.debug { "Ignoring ${it.name} as a Corda service since $serviceType is not one of our " +
-                                "advertised services" }
+                        log.debug {
+                            "Ignoring ${it.name} as a Corda service since $serviceType is not one of our " +
+                                    "advertised services"
+                        }
                         false
                     } else {
                         true
@@ -327,8 +331,17 @@ abstract class AbstractNode(open val configuration: NodeConfiguration,
         }
         cordappServices.putInstance(serviceClass, service)
         smm.tokenizableServices += service
+
+        if (service is NotaryService) handleCustomNotaryService(service)
+
         log.info("Installed ${serviceClass.name} Corda service")
         return service
+    }
+
+    private fun handleCustomNotaryService(service: NotaryService) {
+        runOnStop += service::stop
+        service.start()
+        installCoreFlow(NotaryFlow.Client::class, { party: Party, _ -> service.createServiceFlow(party) })
     }
 
     private inline fun <reified A : Annotation> Class<*>.requireAnnotation(): A {
@@ -684,33 +697,25 @@ abstract class AbstractNode(open val configuration: NodeConfiguration,
     }
 
     open protected fun makeNotaryService(type: ServiceType, tokenizableServices: MutableList<Any>) {
-        val timeWindowChecker = TimeWindowChecker(platformClock, 30.seconds)
-        val uniquenessProvider = makeUniquenessProvider(type)
-        tokenizableServices.add(uniquenessProvider)
-
-        val notaryService = when (type) {
-            SimpleNotaryService.type -> SimpleNotaryService(timeWindowChecker, uniquenessProvider)
-            ValidatingNotaryService.type -> ValidatingNotaryService(timeWindowChecker, uniquenessProvider)
-            RaftNonValidatingNotaryService.type -> RaftNonValidatingNotaryService(timeWindowChecker, uniquenessProvider as RaftUniquenessProvider)
-            RaftValidatingNotaryService.type -> RaftValidatingNotaryService(timeWindowChecker, uniquenessProvider as RaftUniquenessProvider)
-            BFTNonValidatingNotaryService.type -> with(configuration) {
-                val replicaId = bftReplicaId ?: throw IllegalArgumentException("bftReplicaId value must be specified in the configuration")
-                BFTSMaRtConfig(notaryClusterAddresses).use { config ->
-                    BFTNonValidatingNotaryService(config, services, timeWindowChecker, replicaId, database).also {
-                        tokenizableServices += it.client
-                        runOnStop += it::dispose
-                    }
-                }
-            }
+        val service: NotaryService = when (type) {
+            SimpleNotaryService.type -> SimpleNotaryService(services)
+            ValidatingNotaryService.type -> ValidatingNotaryService(services)
+            RaftNonValidatingNotaryService.type -> RaftNonValidatingNotaryService(services)
+            RaftValidatingNotaryService.type -> RaftValidatingNotaryService(services)
+            BFTNonValidatingNotaryService.type -> BFTNonValidatingNotaryService(services)
             else -> {
-                throw IllegalArgumentException("Notary type ${type.id} is not handled by makeNotaryService.")
+                log.info("Notary type ${type.id} does not match any built-in notary types. " +
+                        "It is expected to be loaded via a CorDapp")
+                return
             }
         }
-
-        installCoreFlow(NotaryFlow.Client::class, notaryService.serviceFlowFactory)
+        service.apply {
+            tokenizableServices.add(this)
+            runOnStop += this::stop
+            start()
+        }
+        installCoreFlow(NotaryFlow.Client::class, { otherParty: Party, _ -> service.createServiceFlow(otherParty) })
     }
-
-    protected abstract fun makeUniquenessProvider(type: ServiceType): UniquenessProvider
 
     protected open fun makeIdentityService(trustRoot: X509Certificate,
                                            clientCa: CertificateAndKeyPair?,
