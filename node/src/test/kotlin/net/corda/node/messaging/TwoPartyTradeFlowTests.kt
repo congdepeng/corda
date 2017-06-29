@@ -28,7 +28,6 @@ import net.corda.flows.TwoPartyTradeFlow.Seller
 import net.corda.node.internal.AbstractNode
 import net.corda.node.services.config.NodeConfiguration
 import net.corda.node.services.persistence.DBTransactionStorage
-import net.corda.node.services.persistence.StorageServiceImpl
 import net.corda.node.services.persistence.checkpoints
 import net.corda.node.utilities.transaction
 import net.corda.testing.*
@@ -211,7 +210,7 @@ class TwoPartyTradeFlowTests {
                 assertThat(bobNode.checkpointStorage.checkpoints()).hasSize(1)
             }
 
-            val storage = bobNode.storage.validatedTransactions
+            val storage = bobNode.services.validatedTransactions
             val bobTransactionsBeforeCrash = bobNode.database.transaction {
                 (storage as DBTransactionStorage).transactions
             }
@@ -252,7 +251,9 @@ class TwoPartyTradeFlowTests {
             }
 
             bobNode.database.transaction {
-                val restoredBobTransactions = bobTransactionsBeforeCrash.filter { bobNode.storage.validatedTransactions.getTransaction(it.id) != null }
+                val restoredBobTransactions = bobTransactionsBeforeCrash.filter {
+                    bobNode.services.validatedTransactions.getTransaction(it.id) != null
+                }
                 assertThat(restoredBobTransactions).containsAll(bobTransactionsBeforeCrash)
             }
 
@@ -276,13 +277,9 @@ class TwoPartyTradeFlowTests {
                                 overrideServices: Map<ServiceInfo, KeyPair>?,
                                 entropyRoot: BigInteger): MockNetwork.MockNode {
                 return object : MockNetwork.MockNode(config, network, networkMapAddr, advertisedServices, id, overrideServices, entropyRoot) {
-                    // That constructs the storage service object in a customised way ...
-                    override fun constructStorageService(
-                            attachments: AttachmentStorage,
-                            transactionStorage: TransactionStorage,
-                            stateMachineRecordedTransactionMappingStorage: StateMachineRecordedTransactionMappingStorage
-                    ): StorageServiceImpl {
-                        return StorageServiceImpl(attachments, RecordingTransactionStorage(database, transactionStorage), stateMachineRecordedTransactionMappingStorage)
+                    // That constructs a recording tx storage
+                    override fun createTransactionStorage(): TransactionStorage {
+                        return RecordingTransactionStorage(database, super.createTransactionStorage())
                     }
                 }
             }
@@ -326,7 +323,7 @@ class TwoPartyTradeFlowTests {
             mockNet.runNetwork()
 
             run {
-                val records = (bobNode.storage.validatedTransactions as RecordingTransactionStorage).records
+                val records = (bobNode.services.validatedTransactions as RecordingTransactionStorage).records
                 // Check Bobs's database accesses as Bob's cash transactions are downloaded by Alice.
                 records.expectEvents(isStrict = false) {
                     sequence(
@@ -344,7 +341,7 @@ class TwoPartyTradeFlowTests {
 
                 // Bob has downloaded the attachment.
                 bobNode.database.transaction {
-                    bobNode.storage.attachments.openAttachment(attachmentID)!!.openAsJAR().use {
+                    bobNode.services.attachments.openAttachment(attachmentID)!!.openAsJAR().use {
                         it.nextJarEntry
                         val contents = it.reader().readText()
                         assertTrue(contents.contains("Our commercial paper is top notch stuff"))
@@ -354,7 +351,7 @@ class TwoPartyTradeFlowTests {
 
             // And from Alice's perspective ...
             run {
-                val records = (aliceNode.storage.validatedTransactions as RecordingTransactionStorage).records
+                val records = (aliceNode.services.validatedTransactions as RecordingTransactionStorage).records
                 records.expectEvents(isStrict = false) {
                     sequence(
                             // Seller Alice sends her seller info to Bob, who wants to check the asset for sale.
@@ -422,8 +419,10 @@ class TwoPartyTradeFlowTests {
 
             mockNet.runNetwork() // Clear network map registration messages
 
-            val aliceTxStream = aliceNode.storage.validatedTransactions.track().second
-            val aliceTxMappings = with(aliceNode) { database.transaction { storage.stateMachineRecordedTransactionMapping.track().second } }
+            val aliceTxStream = aliceNode.services.validatedTransactions.track().second
+            val aliceTxMappings = with(aliceNode) {
+                database.transaction { services.stateMachineRecordedTransactionMapping.track().second }
+            }
             val aliceSmId = runBuyerAndSeller(notaryNode, aliceNode, bobNode,
                     "alice's paper".outputStateAndRef()).sellerId
 
@@ -589,7 +588,7 @@ class TwoPartyTradeFlowTests {
         }
         return node.database.transaction {
             node.services.recordTransactions(signed)
-            val validatedTransactions = node.services.storageService.validatedTransactions
+            val validatedTransactions = node.services.validatedTransactions
             if (validatedTransactions is RecordingTransactionStorage) {
                 validatedTransactions.records.clear()
             }
